@@ -1,6 +1,5 @@
 //link with -lFLAC -lao -lpthread switches
 
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
