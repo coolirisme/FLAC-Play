@@ -1,4 +1,4 @@
-//link with -lFLAC -lao -lpthread linker switches
+//link with -lFLAC -lao -lpthread switches
 
 
 #include <stdio.h>
