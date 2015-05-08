@@ -1,11 +1,10 @@
-//link with -lFLAC -lao -lpthread switches
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifdef __gnu_linux__
-	#include <x86_64-linux-gnu/sys/stat.h>
+	#include <x86_64-linux-gnu/sys/stat.h>//64 bit linux
 #elif _DARWIN_
 	#include </sys/stat.h>
 #endif
@@ -14,33 +13,7 @@
 #include <FLAC/stream_decoder.h>
 #include <FLAC/metadata.h>
 #include <ao/ao.h>
-
-FLAC__StreamDecoder *FLAC_decoder;//FLAC decoder handle
-FLAC__StreamMetadata **tags;//Tags handle
-
-ao_device *dev;//Audio device
-ao_sample_format *format;//Output format
-ao_info *driver_info;//Driver info
-int driver;//Driver code
-FLAC__uint64 bytes_count;
-
-pthread_t audio_thread;
-
-int check_if_flac(FILE *fp);
-void initialize_ao();
-void *decode_FLAC();
-void *get_tags(void *arg);
-void print_tags(FLAC__StreamMetadata **tags);
-
-/*CALLBACKS Required by FLAC*/
-static FLAC__StreamDecoderReadStatus read_callback(const FLAC__StreamDecoder *decoder,FLAC__byte buffer[],size_t *bytes,void *client_data);//Read callback
-static FLAC__StreamDecoderWriteStatus write_callback(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC__int32 * const buffer[], void *client_data);//Write callback
-static void metadata_callback(const FLAC__StreamDecoder *decoder, const FLAC__StreamMetadata *metadata, void *client_data);//Metadata callback
-static void error_callback(const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStatus status, void *client_data);//Error callback
-static FLAC__StreamDecoderSeekStatus seek_callback(const FLAC__StreamDecoder *decoder,FLAC__uint64 absolute_byte_offset,void *client_data);//Seek callback
-static FLAC__StreamDecoderTellStatus tell_callback(const FLAC__StreamDecoder *decoder,FLAC__uint64 *absolute_byte_offset,void *client_data);//Tell callback
-static FLAC__StreamDecoderLengthStatus length_callback(const FLAC__StreamDecoder *decoder,FLAC__uint64 *stream_length,void *client_data);//Length callback
-static FLAC__bool eof_callback(const FLAC__StreamDecoder *decoder,void *client_data);//EOF callback
+#include "flacplay.h"
 
 int main(int argc,char **argv)
 {	
@@ -68,12 +41,13 @@ int main(int argc,char **argv)
 			
 			//Start playback
 			fprintf(stderr,"Playing file %d of %d: %s\n",fileindex,(argc-1),filename);
-			fprintf(stderr,"----------------------------------------------------\n");
+			fprintf(stderr,"--------------------------------------------------------\n");
+			get_tags((void *)filename);
 			pthread_create(&audio_thread,NULL,&decode_FLAC,NULL);
 			
 			//Wait for audio to finish
 			pthread_join(audio_thread,NULL);
-			fprintf(stderr,"----------------------------------------------------\n");
+			fprintf(stderr,"--------------------------------------------------------\n");
 
 			//Clean up
 			free(format);
@@ -124,8 +98,38 @@ void *decode_FLAC(void *arg)
 void *get_tags(void *arg)
 {
 	char *filename=(char *)arg;
-	FLAC__bool ok=true;
-	FLAC__metadata_get_tags(filename,tags);
+	FLAC__Metadata_Chain *chain=FLAC__metadata_chain_new();
+	FLAC__Metadata_Iterator *iterator=FLAC__metadata_iterator_new();
+	FLAC__StreamMetadata *metadata;
+
+	if(FLAC__metadata_chain_status(chain)!=FLAC__METADATA_CHAIN_STATUS_OK)
+	{
+		fprintf(stderr,"Error in chain.\n");
+		return 0;
+	}
+	else
+	{
+		FLAC__metadata_chain_read(chain,filename);
+		FLAC__metadata_iterator_init(iterator,chain);
+		int i=0;
+		do
+		{
+			FLAC__metadata_iterator_next(iterator);
+		}
+		while(FLAC__metadata_iterator_get_block_type(iterator)!=FLAC__METADATA_TYPE_VORBIS_COMMENT);
+		
+		metadata=FLAC__metadata_iterator_get_block(iterator);
+		if(metadata->type==FLAC__METADATA_TYPE_VORBIS_COMMENT)
+		{
+			for(i=0;i<(int)metadata->data.vorbis_comment.num_comments;i++)
+			{
+				fprintf(stderr,"%s\n",metadata->data.vorbis_comment.comments[i].entry);
+			}
+		}
+	}
+
+	FLAC__metadata_iterator_delete(iterator);
+	FLAC__metadata_chain_delete(chain);
 	return NULL;
 }
 
@@ -228,19 +232,17 @@ static FLAC__bool eof_callback(const FLAC__StreamDecoder *decoder,void *client_d
 FLAC__StreamDecoderWriteStatus write_callback(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC__int32 * const buffer[], void *client_data)
 {
 	FLAC__int16 audio_buffer[frame->header.channels*frame->header.blocksize];//Audio buffer which is to be played
-	int i;
-	
-	if(frame->header.channels != 2)
-	{
-		fprintf(stderr,"Sorry, this program only support files with two channels.\n");
-		return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-	}
+	int i,j;
 
+	int channels=frame->header.channels;
+	
 	//Fill audio buffer
 	for(i = 0; i < frame->header.blocksize; i++)
 	{
-		audio_buffer[2*i]=(FLAC__int16)buffer[0][i];
-		audio_buffer[2*i+1]=(FLAC__int16)buffer[1][i];
+		for(j = 0; j < channels; j++)
+		{
+			audio_buffer[(channels*i)+j]=(FLAC__int16)buffer[j][i];
+		}
 	}
 	
 	//and play
