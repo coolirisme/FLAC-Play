@@ -9,13 +9,17 @@ ao_device *dev;//Audio device
 ao_sample_format *format;//Output format
 ao_info *driver_info;//Driver info
 int driver;//Driver code
-FLAC__uint64 bytes_count;
 
-pthread_t audio_thread;
+pthread_t decode_thread,play_thread;
+pthread_cond_t cond;
+pthread_mutex_t mutex;
+
+PacketList list;
 
 int check_if_flac(FILE *fp);
 void initialize_ao();
 void *decode_FLAC();
+void *play_FLAC(void *arg);
 void *get_tags(void *arg);
 void print_tags(FLAC__StreamMetadata **tags);
 
