@@ -1,18 +1,17 @@
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #ifdef __gnu_linux__
-	#include <x86_64-linux-gnu/sys/stat.h>//64 bit linux
+	#include <x86_64-linux-gnu/sys/stat.h>
 #elif _DARWIN_
 	#include </sys/stat.h>
 #endif
-
 #include <pthread.h>
 #include <FLAC/stream_decoder.h>
 #include <FLAC/metadata.h>
+#include <FLAC/callback.h>
 #include <ao/ao.h>
+#include "packetqueue.h"
 #include "flacplay.h"
 
 int main(int argc,char **argv)
@@ -38,20 +37,30 @@ int main(int argc,char **argv)
 			FLAC_decoder = FLAC__stream_decoder_new();
 			(void)FLAC__stream_decoder_set_md5_checking(FLAC_decoder,false);
 			FLAC__stream_decoder_init_stream(FLAC_decoder, read_callback, seek_callback, tell_callback, length_callback, eof_callback, write_callback, metadata_callback, error_callback,(void *)fp);
+			PacketQueueInit(list);
+			pthread_cond_init(&cond,NULL);
+			pthread_mutex_init(&mutex,NULL);
 			
 			//Start playback
 			fprintf(stderr,"Playing file %d of %d: %s\n",fileindex,(argc-1),filename);
 			fprintf(stderr,"--------------------------------------------------------\n");
 			get_tags((void *)filename);
-			pthread_create(&audio_thread,NULL,&decode_FLAC,NULL);
+			
+			pthread_create(&decode_thread,NULL,&decode_FLAC,NULL);//Start decoder thread
+			pthread_create(&play_thread,NULL,&play_FLAC,(void *)fp);//Start playback thread
 			
 			//Wait for audio to finish
-			pthread_join(audio_thread,NULL);
+			pthread_join(decode_thread,NULL);
+			pthread_join(play_thread,NULL);
+			
 			fprintf(stderr,"--------------------------------------------------------\n");
 
 			//Clean up
 			free(format);
+			format=NULL;
 			fclose(fp);
+			pthread_mutex_destroy(&mutex);
+			pthread_cond_destroy(&cond);
 			FLAC__stream_decoder_finish(FLAC_decoder);
 			FLAC__stream_decoder_delete(FLAC_decoder);
 			ao_close(dev);
@@ -95,6 +104,47 @@ void *decode_FLAC(void *arg)
 	return NULL;
 }
 
+void *play_FLAC(void *arg)
+{
+	FILE *fp=(FILE *)arg;
+	FLAC__bool ok=false;
+	while(ok==false)
+	{
+		pthread_mutex_lock(&mutex);
+		
+		while(list.num_packets==0)
+		{
+			pthread_cond_wait(&cond,&mutex);
+		}
+		PacketNode *node=PacketQueueGet(&list);
+		ao_play(dev,node->packet,node->packet_size);
+		pthread_cond_signal(&cond);
+		pthread_mutex_unlock(&mutex);
+		fprintf(stderr,"Num of packets in queue : %3d\r",list.num_packets);
+		
+		//Clean up to prevent huge memory leaks
+		free(node->packet);
+		node->packet=NULL;
+		free(node);
+		node=NULL;
+		
+		ok=eof_callback(FLAC_decoder,fp);
+	}
+	
+	//Play remaining packets in queue
+	while(list.num_packets!=0)
+	{
+		PacketNode *node=PacketQueueGet(&list);
+		ao_play(dev,node->packet,node->packet_size);
+		free(node->packet);
+		node->packet=NULL;
+		free(node);
+		node=NULL;
+		fprintf(stderr,"Num of packets in queue : %3d\r",list.num_packets);
+	}
+	return NULL;
+}
+
 void *get_tags(void *arg)
 {
 	char *filename=(char *)arg;
@@ -133,11 +183,6 @@ void *get_tags(void *arg)
 	return NULL;
 }
 
-void print_tags(FLAC__StreamMetadata **tags)
-{
-	fprintf(stdout,"%d\n",(int)tags[0]->data.vorbis_comment.num_comments);
-}
-
 //READ CALLBACK
 static FLAC__StreamDecoderReadStatus read_callback(const FLAC__StreamDecoder *decoder,FLAC__byte buffer[],size_t *bytes,void *client_data)
 {
@@ -156,8 +201,6 @@ static FLAC__StreamDecoderReadStatus read_callback(const FLAC__StreamDecoder *de
 		}
 		else
 		{
-			FLAC__stream_decoder_get_decode_position(decoder,&bytes_count);
-			fprintf(stderr,"BYTES_READ : %lu\r",bytes_count);
 			return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
 		}
 	}
@@ -202,24 +245,30 @@ static FLAC__StreamDecoderTellStatus tell_callback(const FLAC__StreamDecoder *de
 static FLAC__StreamDecoderLengthStatus length_callback(const FLAC__StreamDecoder *decoder,FLAC__uint64 *stream_length,void *client_data)
 {
 	FILE *fp=(FILE *)client_data;
-	struct stat filestats;
 	
 	if(fp==stdin)
 	{
 		return FLAC__STREAM_DECODER_LENGTH_STATUS_UNSUPPORTED;
 	}
-	if(fstat(fileno(fp),&filestats)!=0)
+	
+	struct stat *filestats=(struct stat *)malloc(sizeof(struct stat));
+	if(fstat(fileno(fp),filestats)!=0)
 	{
 		return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
 	}
 	
-	*stream_length=(FLAC__uint64)filestats.st_size;
+	*stream_length=(FLAC__uint64)filestats->st_size;
+	
+	free(filestats);
+	filestats=NULL;
+	
 	return FLAC__STREAM_DECODER_LENGTH_STATUS_OK;
 }
 
 //EOF CALLBACK
 static FLAC__bool eof_callback(const FLAC__StreamDecoder *decoder,void *client_data)//EOF callback
 {
+	(void)decoder;
 	FILE *fp=(FILE *)client_data;
 	if(feof(fp))
 	{
@@ -231,23 +280,34 @@ static FLAC__bool eof_callback(const FLAC__StreamDecoder *decoder,void *client_d
 //FLAC WRITE CALLBACK
 FLAC__StreamDecoderWriteStatus write_callback(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC__int32 * const buffer[], void *client_data)
 {
-	FLAC__int16 audio_buffer[frame->header.channels*frame->header.blocksize];//Audio buffer which is to be played
+	size_t channels=frame->header.channels;
+	size_t blocksize=frame->header.blocksize;
+	
+	FLAC__int16 *audio_buffer=(FLAC__int16 *)malloc((channels * blocksize) * sizeof(FLAC__int16));//Audio buffer which is to be played
+	PacketNode *node=(PacketNode *)malloc(sizeof(PacketNode));
 	int i,j;
-
-	int channels=frame->header.channels;
 	
 	//Fill audio buffer
 	for(i = 0; i < frame->header.blocksize; i++)
 	{
 		for(j = 0; j < channels; j++)
 		{
-			audio_buffer[(channels*i)+j]=(FLAC__int16)buffer[j][i];
+			*(audio_buffer + (channels*i) + j)=(FLAC__int16) *( *(buffer + j) + i);
 		}
 	}
 	
-	//and play
-	ao_play(dev,(char *)audio_buffer,(2*frame->header.channels*frame->header.blocksize));
-	//2 is multiplied to compensate for conversion from FLAC__int16(16 bytes) to char(8 bytes).
+	node->packet=(char *)audio_buffer;
+	node->packet_size=2*channels*blocksize;
+	
+	pthread_mutex_lock(&mutex);
+	while(list.num_packets==100)
+	{
+		pthread_cond_wait(&cond,&mutex);
+	}
+	
+	PacketQueuePut(&list,node);//Put in packet queue
+	pthread_cond_signal(&cond);
+	pthread_mutex_unlock(&mutex);
 	
 	//Continue playing
 	return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
